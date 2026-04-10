@@ -1,0 +1,231 @@
+=== KING OF KINGS 3 SERVER EMULATOR - COMPLETE RESEARCH ===
+Дата: 2026-03-23
+Статус: В разработке (подключение частично работает)
+
+================================================================================
+КРИТИЧЕСКИЕ НАХОДКИ
+================================================================================
+
+1. XOR ШИФРОВАНИЕ
+   - Ключ: BB40E64E (4 байта)
+   - Применяется ко ВСЕМУ сетевому трафику
+   - Функция применения: xor_encrypt(data, "BB40E64E")
+
+2. HANDSHAKE ФОРМАТ
+   - Текст: "0\r\n\r\n" (символы: 30 0D 0A 0D 0A)
+   - После XOR: ab 0c e6 43 d1
+   - Отправляется СЕРВЕРОМ при подключении клиента
+   - Провер��ется функцией FUN_006c72c0 в WE.exe
+
+3. ПОРТЫ ПОДКЛЮЧЕНИЯ
+   - Hardcoded в игре: 4700, 4701, 4702, 4703, 4704
+   - Игра игнорирует worldlist.xml при определении портов
+   - Worldlist становится ПУСТЫМ при нажатии Вход в игру
+
+4. HTTP СЕРВЕР
+   - Порт: 80
+   - Должен отдавать worldlist.xml (в UTF-16 LE)
+   - Должен отдавать patchfile.lst
+   - Игра делает GET запросы к /worldlist.xml и /patchfile.lst
+
+================================================================================
+АДРЕСА В GHIDRA (WE.exe)
+================================================================================
+
+FUN_006c72c0 - ФУНКЦИЯ ПРОВЕРКИ HANDSHAKE
+  ├─ Проверяет наличие строки "0\r\n\r\n" в буфере
+  ├─ Возвращает результат проверки
+  └─ ВАЖНО: Нужно посмотреть полный код (может быть доп. проверки)
+
+FUN_006c75c0 - ФУНКЦИЯ ПОЛУЧЕНИЯ HANDSHAKE
+  ├─ Аргумент: SOCKET *param_1
+  ├─ Выделяет буфер 4096 байт (memset с нулями)
+  ├─ В цикле: recv() -> проверка через FUN_006c72c0
+  ├─ При успехе: param_1[0xf] = 2 (устанавливает флаг)
+  └─ ВОЗВРАЩАЕТ и ВЫХОДИТ (не отправляет ничего в ответ!)
+
+FUN_006c78c4 - ВЫЗЫВАЮЩАЯ ФУНКЦИЯ
+  ├─ Вызывает: FUN_006c75c0()
+  ├─ UNCONDITIONAL_CALL (безусловный вызов)
+  └─ Потом просто return 1
+
+DAT_0054b750 - КОНСТАНТА (используется для проверки буфера)
+
+================================================================================
+ПОЛНЫЙ КОД ТЕКУЩЕГО СЕРВЕРА
+================================================================================
+
+```python
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import socket
+import threading
+import time
+
+WORLDLIST_XML = """<?xml version="1.0" encoding="utf-16"?>
+<server>
+    <zones>
+        <zone id="0" name="RU" type="0">
+            <world id="0" name="WE" port="4981" status="1" type="0">192.168.1.184</world>
+        </zone>
+    </zones>
+</server>"""
+
+WORLDLIST = b'\xff\xfe' + WORLDLIST_XML.encode('utf-16-le')
+PATCHFILE = b'\xff\xfe' + "0\r\n".encode('utf-16-le')
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = self.path
+        host = self.headers.get('Host')
+        user_agent = self.headers.get('User-Agent')
+        
+        print(f"\n[HTTP GET] {path}")
+        print(f"[HOST] {host}")
+        print(f"[USER-AGENT] {user_agent}")
+
+        if 'worldlist.xml' in path:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/xml; charset=utf-16')
+            self.send_header('Content-Length', str(len(WORLDLIST)))
+            self.end_headers()
+            self.wfile.write(WORLDLIST)
+            print("[SENT] worldlist.xml")
+            
+        elif 'patchfile.lst' in path:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', str(len(PATCHFILE)))
+            self.end_headers()
+            self.wfile.write(PATCHFILE)
+            print("[SENT] patchfile.lst")
+            
+        else:
+            print(f"[UNKNOWN] {path}")
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"OK")
+            print("[SENT] OK")
+
+    def log_message(self, format, *args):
+        pass
+
+def start_http_server():
+    print("[*] HTTP Сервер запущен на порту 80...")
+    server = HTTPServer(('0.0.0.0', 80), Handler)
+    server.serve_forever()
+
+def xor_encrypt(data, key):
+    key_bytes = bytes.fromhex(key)
+    result = bytearray()
+    for i, byte in enumerate(data):
+        result.append(byte ^ key_bytes[i % len(key_bytes)])
+    return bytes(result)
+
+def handle_game_client(conn, addr, port):
+    print(f"\n[GAME] {addr[0]}:{addr[1]} подключился к порту {port}")
+    
+    handshake = b"0\r\n\r\n"
+    encrypted = xor_encrypt(handshake, "BB40E64E")
+    
+    conn.send(encrypted)
+    print(f"[SENT] Handshake: {encrypted.hex()}")
+    
+    conn.settimeout(10)
+    
+    try:
+        data = conn.recv(4096)
+        if data:
+            print(f"[RECV] {len(data)} bytes: {data.hex()}")
+        else:
+            print("[RECV] Пусто")
+    except socket.timeout:
+        print("[TIMEOUT]")
+    except Exception as e:
+        print(f"[ERROR] {e}")
+    finally:
+        conn.close()
+
+def listen_port(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('0.0.0.0', port))
+    s.listen(5)
+    print(f"[*] Порт {port} слушает...")
+    
+    while True:
+        try:
+            conn, addr = s.accept()
+            threading.Thread(target=handle_game_client, args=(conn, addr, port), daemon=True).start()
+        except Exception as e:
+            print(f"[ERROR] Порт {port}: {e}")
+
+if __name__ == '__main__':
+    print("[*] King of Kings 3 Server (HTTP + Game)")
+    
+    threading.Thread(target=start_http_server, daemon=True).start()
+    
+    for port in [4700, 4701, 4702, 4703, 4704]:
+        threading.Thread(target=listen_port, args=(port,), daemon=True).start()
+    
+    print("[*] Все серверы запущены!")
+    
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[*] Завершение...")
+================================================================================ ТЕКУЩИЙ СТАТУС
+✅ РАБОТАЕТ:
+
+HTTP сервер на порту 80
+Отправка worldlist.xml в правильном формате (UTF-16 LE)
+Игра успешно подключается к портам 4700-4704
+XOR шифрование/дешифрование работает
+❌ НЕ РАБОТАЕТ:
+
+После отправки handshake игра не отвечает
+TIMEOUT при ожидании ответа от игры
+Игра показывает ошибку "Подключение к сети было прервано"
+================================================================================ ПРОВЕРЕННЫЕ ГИПОТЕЗЫ (НЕ СРАБОТАЛИ)
+❌ Игра отправляет что-то первая
+
+Результат: Ничего не приходит
+❌ Нужна инициализация перед handshake
+
+Пробовали: 00000000, 01000000, 00000001, 04000000, 53594e43, ffffffff, 504b0304
+Результат: Всё дало TIMEOUT
+❌ Порт 4981 из worldlist
+
+Результат: Игра всё равно подключается к 4700-4704
+❌ Worldlist влияет на подключение
+
+Результат: Worldlist становится пустым при Вход, игра игнорирует его
+================================================================================ СЛЕДУЮЩИЕ ШАГИ ДЛЯ РАССЛЕДОВАНИЯ
+⭐ ПРИОРИТЕТ 1: Посмотреть FUN_006c72c0 ПОЛНОСТЬЮ в Ghidra декомпиляторе
+
+Может быть там не только проверка strstr() но и ещё что-то
+Может быть нужна дополнительная проверка или трансформация
+⭐ ПРИОРИТЕТ 2: Понять что происходит ПОСЛЕ успешной проверки handshake
+
+Флаг param_1[0xf] = 2 устанавливается
+Где этот флаг потом проверяется?
+Может быть нужно отправить какой-то ACK пакет?
+Посмотреть References к FUN_006c75c0
+
+Выяснить в каком потоке она запускается
+Посмотреть что происходит в основном потоке
+Анализ сетевых логов (Wireshark)
+
+Может ли помочь в понимании что игра ожидает
+================================================================================ КОМАНДЫ ДЛЯ GHIDRA
+Перейти к функции: G -> введи адрес (например 006c72c0) Найти References: Правая кнопка на названии функции -> References -> Find References Декомпилятор: F (включить/выключить) Поиск по коду: Ctrl+F
+
+================================================================================ ЗАПУСК СЕРВЕРА
+python D:\gameserver.py
+
+Сервер слушает:
+
+Порт 80 (HTTP)
+Порты 4700-4704 (Game protocol)
+================================================================================

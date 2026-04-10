@@ -1,0 +1,332 @@
+=== KING OF KINGS 3 SERVER EMULATOR - COMPLETE RESEARCH ===
+Дата: 2026-03-23
+Статус: В разработке (подключение частично работает)
+
+================================================================================
+КРИТИЧЕСКИЕ НАХОДКИ
+================================================================================
+
+1. XOR ШИФРОВАНИЕ
+   - Ключ: BB40E64E (4 байта)
+   - Применяется ко ВСЕМУ сетевому трафику
+   - Функция применения: xor_encrypt(data, "BB40E64E")
+   - Тестировано: "0\r\n\r\n" -> ab0ce643d1 ✓ РАБОТАЕТ
+
+2. HANDSHAKE ФОРМАТ
+   - Текст: "0\r\n\r\n" (символы: 30 0D 0A 0D 0A)
+   - После XOR: ab 0c e6 43 d1
+   - Отправляется СЕРВЕРОМ при подключении клиента
+   - Проверяется функцией FUN_006c72c0 в WE.exe
+
+3. ПОРТЫ ПОДКЛЮЧЕНИЯ
+   - Hardcoded в игре: 4700, 4701, 4702, 4703, 4704
+   - Игра игнорирует worldlist.xml при определении портов
+   - Worldlist становится ПУСТЫМ при нажатии Вход в игру
+
+4. HTTP СЕРВЕР
+   - Порт: 80
+   - Должен отдавать worldlist.xml (в UTF-16 LE)
+   - Должен отдавать patchfile.lst
+   - Игра делает GET запросы к /worldlist.xml и /patchfile.lst
+
+================================================================================
+АДРЕСА В GHIDRA (WE.exe)
+================================================================================
+
+FUN_006c72c0 - ФУНКЦИЯ ПРОВЕРКИ HANDSHAKE
+  ├─ Адрес: 006c72c0
+  ├─ Проверяет наличие строки "0\r\n\r\n" в буфере
+  ├─ Возвращает результат проверки
+  ├─ НАЙДЕНО: использует strstr() для поиска
+  └─ ВАЖНО: Нужно посмотреть полный код (может быть доп. проверки)
+
+FUN_006c75c0 - ФУНКЦИЯ ПОЛУЧЕНИЯ HANDSHAKE
+  ├─ Адрес: 006c75c0
+  ├─ Аргумент: SOCKET *param_1
+  ├─ Выделяет буфер 4096 байт (memset с нулями)
+  ├─ В ЦИКЛЕ: recv() -> проверка через FUN_006c72c0
+  ���─ При успехе: param_1[0xf] = 2 (устанавливает флаг)
+  ├─ ПОСЛЕ ПРОВЕРКИ: просто return (НЕ отправляет ничего!)
+  ├─ Декомпилированный код (ПРОВЕРЕНО):
+  │   void __fastcall FUN_006c75c0(SOCKET *param_1)
+  │   {
+  │       char cVar1;
+  │       int iVar2;
+  │       char local_1004 [4096];
+  │       uint local_4;
+  │       
+  │       local_4 = DAT_0054b750 ^ (uint)local_1004;
+  │       if (*param_1 != 0) {
+  │           do {
+  │               _memset(local_1004, 0, 0x1000);
+  │               iVar2 = recv(param_1, local_1004, 0x1000, 0);
+  │               if ((iVar2 < 1) || (iVar2 < 0x1000)) {
+  │                   Sleep(10);
+  │               }
+  │           } while (cVar1 == '\0');
+  │           
+  │           cVar1 = FUN_006c72c0(local_1004);  // ПРОВЕРКА HANDSHAKE
+  │           } while (cVar1 == '\0');
+  │           
+  │           param_1[0xf] = 2;                  // ФЛАГ УСПЕХА
+  │           __security_check_cookie(local_4 ^ (uint)local_1004);
+  │           return;
+  │       }
+  │   }
+  └─ ВЫВОД: Функция просто устанавливает флаг и выходит!
+
+FUN_006c78c4 - ВЫЗЫВАЮЩАЯ ФУНКЦИЯ
+  ├─ Адрес: 006c78c4
+  ├─ Вызывает: FUN_006c75c0()
+  ├─ UNCONDITIONAL_CALL (безусловный вызов)
+  ├─ Dekompilirovanniy kod:
+  │   undefined FUN_006c78c4(void)
+  │   {
+  │       FUN_006c75c0();
+  │       return 1;
+  │   }
+  └─ ВЫВОД: Просто вызов и return, ничего больше!
+
+DAT_0054b750 - КОНСТАНТА (используется для проверки буфера)
+
+================================================================================
+АНАЛИЗ ИЗ СКРИНШОТОВ GHIDRA
+================================================================================
+
+СКРИНШОТ 4 (FUN_006c75c0 декомпилятор):
+- Видна полная функция с recv() в цикле
+- После проверки FUN_006c72c0 сразу param_1[0xf] = 2
+- Потом security_check_cookie и return
+- Вывод: Сервер НЕ ОТПРАВЛЯЕТ НИЧЕГО после handshake!
+
+СКРИНШОТ 5 (References к FUN_006c75c0):
+- Только 1 место вызова: адрес 006c78c4
+- UNCONDITIONAL_CALL - безусловный вызов
+- Вывод: Функция вызывается всегда одинаково
+
+СКРИНШОТ 6 (FUN_006c78c4):
+- Очень простая функция: просто вызов FUN_006c75c0() и return 1
+- Вывод: Логика обработки где-то ПОСЛЕ этого вызова
+
+================================================================================
+ПОЛНЫЙ КОД ТЕКУЩЕГО СЕРВЕРА
+================================================================================
+
+```python
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import socket
+import threading
+import time
+
+WORLDLIST_XML = """<?xml version="1.0" encoding="utf-16"?>
+<server>
+    <zones>
+        <zone id="0" name="RU" type="0">
+            <world id="0" name="WE" port="4981" status="1" type="0">192.168.1.184</world>
+        </zone>
+    </zones>
+</server>"""
+
+WORLDLIST = b'\xff\xfe' + WORLDLIST_XML.encode('utf-16-le')
+PATCHFILE = b'\xff\xfe' + "0\r\n".encode('utf-16-le')
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = self.path
+        host = self.headers.get('Host')
+        user_agent = self.headers.get('User-Agent')
+        
+        print(f"\n[HTTP GET] {path}")
+        print(f"[HOST] {host}")
+        print(f"[USER-AGENT] {user_agent}")
+
+        if 'worldlist.xml' in path:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/xml; charset=utf-16')
+            self.send_header('Content-Length', str(len(WORLDLIST)))
+            self.end_headers()
+            self.wfile.write(WORLDLIST)
+            print("[SENT] worldlist.xml")
+            
+        elif 'patchfile.lst' in path:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', str(len(PATCHFILE)))
+            self.end_headers()
+            self.wfile.write(PATCHFILE)
+            print("[SENT] patchfile.lst")
+            
+        else:
+            print(f"[UNKNOWN] {path}")
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"OK")
+            print("[SENT] OK")
+
+    def log_message(self, format, *args):
+        pass
+
+def start_http_server():
+    print("[*] HTTP Сервер запущен на порту 80...")
+    server = HTTPServer(('0.0.0.0', 80), Handler)
+    server.serve_forever()
+
+def xor_encrypt(data, key):
+    key_bytes = bytes.fromhex(key)
+    result = bytearray()
+    for i, byte in enumerate(data):
+        result.append(byte ^ key_bytes[i % len(key_bytes)])
+    return bytes(result)
+
+def handle_game_client(conn, addr, port):
+    print(f"\n[GAME] {addr[0]}:{addr[1]} подключился к порту {port}")
+    
+    handshake = b"0\r\n\r\n"
+    encrypted = xor_encrypt(handshake, "BB40E64E")
+    
+    conn.send(encrypted)
+    print(f"[SENT] Handshake: {encrypted.hex()}")
+    
+    conn.settimeout(10)
+    
+    try:
+        data = conn.recv(4096)
+        if data:
+            print(f"[RECV] {len(data)} bytes: {data.hex()}")
+        else:
+            print("[RECV] Пусто")
+    except socket.timeout:
+        print("[TIMEOUT]")
+    except Exception as e:
+        print(f"[ERROR] {e}")
+    finally:
+        conn.close()
+
+def listen_port(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('0.0.0.0', port))
+    s.listen(5)
+    print(f"[*] Порт {port} слушает...")
+    
+    while True:
+        try:
+            conn, addr = s.accept()
+            threading.Thread(target=handle_game_client, args=(conn, addr, port), daemon=True).start()
+        except Exception as e:
+            print(f"[ERROR] Порт {port}: {e}")
+
+if __name__ == '__main__':
+    print("[*] King of Kings 3 Server (HTTP + Game)")
+    
+    threading.Thread(target=start_http_server, daemon=True).start()
+    
+    for port in [4700, 4701, 4702, 4703, 4704]:
+        threading.Thread(target=listen_port, args=(port,), daemon=True).start()
+    
+    print("[*] Все серверы запущены!")
+    
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[*] Завершение...")
+================================================================================ ЛОГИ ПОДКЛЮЧЕНИЯ (ИЗ СКРИНШОТОВ)
+СКРИНШОТ 7 (XOR handshake сработал): [GAME] 192.168.1.184:54968 подключился к порту 4700 [PLAIN] 300d0a0d0a [ENCRYPTED] ab0ce643d1 [SENT] XOR Handshake [TIMEOUT] ✓ XOR шифрование РАБОТАЕТ ✗ Но игра молчит в ответ
+
+СКРИНШОТ 8 (Попытка разных инициализационных пакетов): [GAME] 192.168.1.184:55150 подключился к порту 4703 [TRY] 4 нулевых байта: 00000000 [TIMEOUT] [TRY] версия 1 LE: 01000000 [TIMEOUT] [TRY] версия 1 BE: 00000001 [TIMEOUT] [TRY] размер 4: 04000000 [TIMEOUT] [TRY] текст SYNC: 53594e43 [TIMEOUT] [TRY] 4 FF байта: ffffffff [TIMEOUT] [TRY] ZIP сигнатура?: 504b0304 [TIMEOUT] [FAILED] Ничего не сработало ✗ Никакой инициализации перед handshake не требуется
+
+СКРИНШОТ 9 (Смена порта на 4981): [GAME] 192.168.1.184:55150 подключился к порту 4703 Потом перезапуск сервера с портом 4981 ✓ Сервер успешно переключился на 4981 ✗ Но игра всё ещё подключается к 4703 (кэш)
+
+================================================================================ ТЕКУЩИЙ СТАТУС
+✅ РАБОТАЕТ:
+
+HTTP сервер на порту 80
+Отправка worldlist.xml в правильном формате (UTF-16 LE)
+Игра успешно подключается к портам 4700-4704
+XOR шифрование/дешифрование РАБОТАЕТ И ПРОВЕРЕНО
+Handshake отправляется в правильном формате
+❌ НЕ РАБОТАЕТ:
+
+После отправки handshake игра не отвечает
+TIMEOUT при ожидании ответа от игры
+Игра показывает ошибку "Подключение к сети было прервано"
+================================================================================ ПРОВЕРЕННЫЕ ГИПОТЕЗЫ (НЕ СРАБОТАЛИ)
+❌ Игра отправляет что-то первая
+
+Результат: Ничего не приходит
+❌ Нужна инициализация перед handshake
+
+Пробовали: 00000000, 01000000, 00000001, 04000000, 53594e43, ffffffff, 504b0304
+Результат: Всё дало TIMEOUT
+❌ Порт 4981 из worldlist
+
+Результат: Игра всё равно подключается к 4700-4704
+❌ Worldlist влияет на подключение
+
+Результат: Worldlist становится пустым при Вход, игра игнорирует его
+================================================================================ КЛЮЧЕВАЯ ПРОБЛЕМА И ГИПОТЕЗЫ
+ПРОБЛЕМА:
+
+Игра подключается ✓
+Сервер отправляет handshake (XOR зашифрованный) ✓
+Игра получает handshake (проверяется в FUN_006c72c0) ?
+Игра устанавливает флаг param_1[0xf] = 2 ?
+Но потом... TIMEOUT. Игра молчит и соединение закрывается ✗
+ПОЧЕМУ ТАК ПРОИСХОДИТ?
+
+Вариант 1: Handshake отправляется неправильно
+
+Может быть нужно отправить ДОПОЛНИТЕЛЬНЫЕ данные после handshake?
+Может быть handshake имеет ДРУГОЙ формат?
+Вариант 2: После handshake нужно ждать инициализации ОТ ИГРЫ
+
+Игра сначала принимает handshake
+Потом САМА что-то отправляет
+Мы должны на это ответить
+Вариант 3: После FUN_006c75c0 вызывается ДРУГАЯ функция которая обрабатывает соединение
+
+FUN_006c75c0 просто проверяет handshake
+Потом запускается FUN_006c7990 или другая функция
+ЭТА функция должна получать/отправлять реальные данные
+Вариант 4: Флаг param_1[0xf] = 2 ждётся в другом потоке
+
+Основной поток проверяет флаг
+Пока флаг не установлен, соединение закрывается
+ЭТО ОБЪЯСНЯЕТ ПОЧЕМУ TIMEOUT ПРОИСХОДИТ!
+================================================================================ СЛЕДУЮЩИЕ ШАГИ ДЛЯ РАССЛЕДОВАНИЯ
+⭐ ПРИОРИТЕТ 1: Посмотреть FUN_006c72c0 ПОЛНОСТЬЮ в Ghidra декомпиляторе
+
+Может быть там не только проверка strstr() но и ещё что-то
+Может быть нужна дополнитель��ая проверка или трансформация
+Может быть функция ОТПРАВЛЯЕТ ACK пакет?
+⭐ ПРИОРИТЕТ 2: Найти где ИСПОЛЬЗУЕТСЯ флаг param_1[0xf] == 2
+
+Это скорее всего в основном потоке обработки подключения
+Найти References к param_1[0xf]
+Посмотреть что происходит когда флаг == 2
+⭐ ПРИОРИТЕТ 3: Найти FUN_006c7990 (функция HTTP GET)
+
+Посмотреть её полный код
+Понять когда она запускается
+Может быть она запускается в отдельном потоке ДО установки флага?
+Посмотреть References к FUN_006c78c4
+
+Выяснить в каком потоке она запускается
+Посмотреть что происходит в основном потоке
+Анализ сетевых логов (Wireshark)
+
+Может ли помочь в понимании что игра ожидает
+================================================================================ КОМАНДЫ ДЛЯ GHIDRA
+Перейти к функции: G -> введи адрес (например 006c72c0) Найти References: Правая кнопка на названии функции -> References -> Find References Декомпилятор: F (включить/выключить) Поиск по коду: Ctrl+F Поиск по строке: Ctrl+Shift+F (Global Search)
+
+================================================================================ ЗАПУСК СЕРВЕРА
+python D:\gameserver.py
+
+Сервер слушает:
+
+Порт 80 (HTTP)
+Порты 4700-4704 (Game protocol)
+================================================================================ ВАЖНЫЕ ЗАМЕЧАНИЯ ОТ ПОЛЬЗОВАТЕЛЯ
+"Та какой Worldlist если мы обговаривали уже что он пустой становится при заходе в игру" → Это подтверждает что worldlist НЕ влияет на выбор портов → Игра использует hardcoded порты 4700-4704
